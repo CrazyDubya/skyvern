@@ -194,6 +194,30 @@ export type CreateOnePasswordTokenResponse = {
   token: OnePasswordTokenApiResponse;
 };
 
+export interface AzureClientSecretCredential {
+  tenant_id: string;
+  client_id: string;
+  client_secret: string;
+}
+
+export interface AzureOrganizationAuthToken {
+  id: string;
+  organization_id: string;
+  credential: AzureClientSecretCredential;
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+}
+
+export interface CreateAzureClientSecretCredentialRequest {
+  credential: AzureClientSecretCredential;
+}
+
+export interface AzureClientSecretCredentialResponse {
+  token: AzureOrganizationAuthToken;
+}
+
 // TODO complete this
 export const ActionTypes = {
   InputText: "input_text",
@@ -296,6 +320,7 @@ export type DebugSessionApiResponse = {
   workflow_permanent_id: string | null;
   created_at: string;
   modified_at: string;
+  vnc_streaming_supported: boolean | null;
 };
 
 export type WorkflowRunApiResponse = {
@@ -303,6 +328,7 @@ export type WorkflowRunApiResponse = {
   failure_reason: string | null;
   modified_at: string;
   proxy_location: ProxyLocation | null;
+  script_run: boolean | null;
   status: Status;
   title?: string;
   webhook_callback_url: string;

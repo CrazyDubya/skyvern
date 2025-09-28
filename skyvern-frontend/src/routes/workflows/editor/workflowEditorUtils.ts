@@ -149,7 +149,7 @@ export function descendants(nodes: Array<AppNode>, id: string): Array<AppNode> {
 export function getLoopNodeWidth(node: AppNode, nodes: Array<AppNode>): number {
   const maxNesting = maxNestingLevel(nodes);
   const nestingLevel = getNestingLevel(node, nodes);
-  return 600 + (maxNesting - nestingLevel) * 50;
+  return 450 + (maxNesting - nestingLevel) * 50;
 }
 
 function maxNestingLevel(nodes: Array<AppNode>): number {
@@ -705,8 +705,11 @@ function getElements(
       editable,
       useScriptCache: settings.useScriptCache,
       scriptCacheKey: settings.scriptCacheKey,
+      aiFallback: settings.aiFallback ?? true,
       label: "__start_block__",
       showCode: false,
+      runSequentially: settings.runSequentially,
+      sequentialKey: settings.sequentialKey,
     }),
   );
 
@@ -1416,6 +1419,9 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     extraHttpHeaders: null,
     useScriptCache: false,
     scriptCacheKey: null,
+    aiFallback: true,
+    runSequentially: false,
+    sequentialKey: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1435,6 +1441,9 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       extraHttpHeaders: data.extraHttpHeaders,
       useScriptCache: data.useScriptCache,
       scriptCacheKey: data.scriptCacheKey,
+      aiFallback: data.aiFallback,
+      runSequentially: data.runSequentially,
+      sequentialKey: data.sequentialKey,
     };
   }
   return defaultSettings;
@@ -1802,6 +1811,16 @@ function convertParametersToParameterYAML(
             item_id: parameter.item_id,
           };
         }
+        case WorkflowParameterTypes.Azure_Vault_Credential: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.Azure_Vault_Credential,
+            vault_name: parameter.vault_name,
+            username_key: parameter.username_key,
+            password_key: parameter.password_key,
+            totp_secret_key: parameter.totp_secret_key,
+          };
+        }
       }
     })
     .filter(Boolean);
@@ -2114,6 +2133,11 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
     },
     is_saved_task: workflow.is_saved_task,
+    generate_script: workflow.generate_script,
+    cache_key: workflow.cache_key,
+    ai_fallback: workflow.ai_fallback ?? undefined,
+    run_sequentially: workflow.run_sequentially ?? undefined,
+    sequential_key: workflow.sequential_key ?? undefined,
   };
 }
 
@@ -2162,6 +2186,14 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     } catch {
       errors.push(`${node.data.label}: Error messages is not valid JSON.`);
     }
+    // Validate Task data schema JSON when enabled (value different from "null")
+    if (node.data.dataSchema && node.data.dataSchema !== "null") {
+      try {
+        JSON.parse(node.data.dataSchema);
+      } catch {
+        errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+      }
+    }
   });
 
   const validationNodes = nodes.filter(isValidationNode);
@@ -2192,6 +2224,14 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   extractionNodes.forEach((node) => {
     if (node.data.dataExtractionGoal.length === 0) {
       errors.push(`${node.data.label}: Data extraction goal is required.`);
+    }
+    // Validate Extraction data schema JSON when enabled (value different from "null")
+    if (node.data.dataSchema && node.data.dataSchema !== "null") {
+      try {
+        JSON.parse(node.data.dataSchema);
+      } catch {
+        errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+      }
     }
   });
 

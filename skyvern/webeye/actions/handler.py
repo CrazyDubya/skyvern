@@ -29,6 +29,7 @@ from skyvern.exceptions import (
     FailedToFetchSecret,
     FailToClick,
     FailToSelectByIndex,
+    FailToSelectByLabel,
     FailToSelectByValue,
     IllegitComplete,
     ImaginaryFileUrl,
@@ -47,7 +48,6 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
-    NoTOTPVerificationCodeFound,
     OptionIndexOutOfBound,
     WrongElementToUploadFile,
 )
@@ -63,16 +63,14 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
-from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.forge.sdk.services.credentials import OnePasswordConstants
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.trace import TraceManager
-from skyvern.services.task_v1_service import is_cua_task
+from skyvern.services import service_utils
+from skyvern.services.action_service import get_action_history
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
     CheckPhoneNumberFormatResponse,
@@ -92,12 +90,14 @@ from skyvern.webeye.actions.actions import (
     SelectOption,
     SelectOptionAction,
     UploadFileAction,
+    UserDefinedError,
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraper import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
+    ElementTreeFormat,
     IncrementalScrapePage,
     ScrapedPage,
     hash_element,
@@ -393,6 +393,7 @@ class ActionHandler:
     ) -> list[ActionResult]:
         LOG.info("Handling action", action=action)
         actions_result: list[ActionResult] = []
+        llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
         try:
             if action.action_type in ActionHandler._handled_action_types:
                 invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
@@ -411,28 +412,6 @@ class ActionHandler:
                 handler = ActionHandler._handled_action_types[action.action_type]
                 results = await handler(action, page, scraped_page, task, step)
                 actions_result.extend(results)
-                llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
-                if not results or not isinstance(actions_result[-1], ActionSuccess):
-                    if llm_caller and action.tool_call_id:
-                        # add failure message to the llm caller
-                        tool_call_result = {
-                            "type": "tool_result",
-                            "tool_use_id": action.tool_call_id,
-                            "content": "Tool execution failed",
-                        }
-                        llm_caller.add_tool_result(tool_call_result)
-                        LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
-                    return actions_result
-
-                if llm_caller and action.tool_call_id:
-                    tool_call_result = {
-                        "type": "tool_result",
-                        "tool_use_id": action.tool_call_id,
-                        "content": "Tool executed successfully",
-                    }
-                    LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
-                    llm_caller.add_tool_result(tool_call_result)
-
                 # do the teardown
                 teardown = ActionHandler._teardown_action_types.get(action.action_type)
                 if teardown:
@@ -470,16 +449,30 @@ class ActionHandler:
             LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
         finally:
+            tool_result_content = ""
+
             if actions_result and isinstance(actions_result[-1], ActionSuccess):
                 action.status = ActionStatus.completed
+                tool_result_content = "Tool executed successfully"
             elif actions_result and isinstance(actions_result[-1], ActionAbort):
                 action.status = ActionStatus.skipped
+                tool_result_content = "Tool executed successfully"
             else:
+                tool_result_content = "Tool execution failed"
                 # either actions_result is empty or the last action is a failure
                 if not actions_result:
                     LOG.warning("Action failed to execute, setting status to failed", action=action)
                 action.status = ActionStatus.failed
+
             await app.DATABASE.create_action(action=action)
+
+            if llm_caller and action.tool_call_id:
+                tool_call_result = {
+                    "type": "tool_result",
+                    "tool_use_id": action.tool_call_id,
+                    "content": tool_result_content,
+                }
+                llm_caller.add_tool_result(tool_call_result)
 
         return actions_result
 
@@ -543,7 +536,7 @@ async def handle_click_action(
                     if (element.hasAttribute('unique_id')) {
                         return element.getAttribute('unique_id');
                     }
-                    
+
                     // If no unique_id attribute is found, return null
                     return null;
                 }
@@ -556,9 +549,9 @@ async def handle_click_action(
         )
         LOG.info("Clicked element at location", x=action.x, y=action.y, element_id=element_id, button=action.button)
         if element_id:
-            skyvern_element = await dom.get_skyvern_element_by_id(element_id)
-            if await skyvern_element.navigate_to_a_href(page=page):
-                return [ActionSuccess()]
+            if skyvern_element := await dom.safe_get_skyvern_element_by_id(element_id):
+                if await skyvern_element.navigate_to_a_href(page=page):
+                    return [ActionSuccess()]
 
         if action.repeat == 1:
             await page.mouse.click(x=action.x, y=action.y, button=action.button)
@@ -753,7 +746,7 @@ async def handle_sequential_click_for_dropdown(
         action_history=action_history_str,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
-    response = await app.SECONDARY_LLM_API_HANDLER(
+    response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
         prompt=prompt,
         step=step,
         prompt_name="check-user-goal",
@@ -781,9 +774,9 @@ async def handle_sequential_click_for_dropdown(
         action=AbstractActionForContextParse(
             reasoning=action.reasoning, intention=action.intention, element_id=action.element_id
         ),
-        step=step,
-        element_tree_builder=scraped_page,
         skyvern_element=anchor_element,
+        element_tree_builder=scraped_page,
+        step=step,
     )
 
     if dropdown_select_context.is_date_related:
@@ -836,6 +829,12 @@ async def handle_click_to_download_file_action(
         get_download_dir(run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id)
     )
     list_files_before = list_files_in_directory(download_dir)
+    if task.browser_session_id:
+        files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+            organization_id=task.organization_id, browser_session_id=task.browser_session_id
+        )
+        list_files_before = list_files_before + files_in_browser_session
+
     LOG.info(
         "Number of files in download directory before click",
         num_downloaded_files_before=len(list_files_before),
@@ -868,6 +867,12 @@ async def handle_click_to_download_file_action(
         async with asyncio.timeout(BROWSER_DOWNLOAD_MAX_WAIT_TIME):
             while True:
                 list_files_after = list_files_in_directory(download_dir)
+                if task.browser_session_id:
+                    files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                        organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                    )
+                    list_files_after = list_files_after + files_in_browser_session
+
                 if len(list_files_after) > len(list_files_before):
                     LOG.info(
                         "Found new files in download directory after click",
@@ -891,6 +896,12 @@ async def handle_click_to_download_file_action(
 
     # check if there's any file is still downloading
     downloading_files = list_downloading_files_in_directory(download_dir)
+    if task.browser_session_id:
+        files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
+            organization_id=task.organization_id, browser_session_id=task.browser_session_id
+        )
+        downloading_files = downloading_files + files_in_browser_session
+
     if len(downloading_files) == 0:
         return [ActionSuccess(download_triggered=True)]
 
@@ -944,7 +955,9 @@ async def handle_input_text_action(
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
 
-    is_totp_value = text == BitwardenConstants.TOTP or text == OnePasswordConstants.TOTP
+    is_totp_value = (
+        text == BitwardenConstants.TOTP or text == OnePasswordConstants.TOTP or text == AzureVaultConstants.TOTP
+    )
     is_secret_value = text != action.text
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
@@ -1165,7 +1178,9 @@ async def handle_input_text_action(
             LOG.warning(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
-            skyvern_element = blocking_element
+            if await blocking_element.is_editable():
+                skyvern_element = blocking_element
+                tag_name = blocking_element.get_tag_name()
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
@@ -1777,6 +1792,10 @@ async def handle_terminate_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if task.error_code_mapping:
+        action.errors = await extract_user_defined_errors(
+            task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
+        )
     return [ActionSuccess()]
 
 
@@ -1816,6 +1835,7 @@ async def handle_complete_action(
             workflow_run_id=task.workflow_run_id,
         )
         action.verified = True
+
         if not task.data_extraction_goal and verification_result.thoughts:
             await app.DATABASE.update_task(
                 task.task_id,
@@ -2297,7 +2317,7 @@ async def choose_auto_completion_dropdown(
             step_id=step.step_id,
             task_id=task.task_id,
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(
+        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
             prompt=auto_completion_confirm_prompt, step=step, prompt_name="auto-completion-choose-option"
         )
         element_id = json_response.get("id", "")
@@ -3398,9 +3418,20 @@ async def normal_select(
     action_result: List[ActionResult] = []
     is_success = False
     locator = skyvern_element.get_locator()
+
     input_or_select_context = await _get_input_or_select_context(
-        action=action, element_tree_builder=builder, step=step, skyvern_element=skyvern_element
+        action=action,
+        element_tree_builder=builder,
+        step=step,
+        skyvern_element=skyvern_element,
     )
+    LOG.info(
+        "Parsed input/select context",
+        context=input_or_select_context,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
     await skyvern_element.refresh_select_options()
     options_html = skyvern_element.build_HTML()
     field_information = (
@@ -3420,20 +3451,6 @@ async def normal_select(
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 
-    try:
-        await locator.click(
-            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-        )
-    except Exception as e:
-        LOG.info(
-            "Failed to click before select action",
-            exc_info=True,
-            action=action,
-            locator=locator,
-        )
-        action_result.append(ActionFailure(e))
-        return action_result
-
     if not is_success and value is not None:
         try:
             # click by value (if it matches)
@@ -3447,6 +3464,24 @@ async def normal_select(
             action_result.append(ActionFailure(FailToSelectByValue(action.element_id)))
             LOG.info(
                 "Failed to take select action by value",
+                exc_info=True,
+                action=action,
+                locator=locator,
+            )
+
+    if not is_success and value is not None:
+        try:
+            # click by label (if it matches)
+            await locator.select_option(
+                label=value,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+            )
+            is_success = True
+            action_result.append(ActionSuccess())
+        except Exception:
+            action_result.append(ActionFailure(FailToSelectByLabel(action.element_id)))
+            LOG.info(
+                "Failed to take select action by label",
                 exc_info=True,
                 action=action,
                 locator=locator,
@@ -3477,20 +3512,6 @@ async def normal_select(
                     action=action,
                     locator=locator,
                 )
-
-    try:
-        await locator.click(
-            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-        )
-    except Exception as e:
-        LOG.info(
-            "Failed to click after select action",
-            exc_info=True,
-            action=action,
-            locator=locator,
-        )
-        action_result.append(ActionFailure(e))
-        return action_result
 
     if len(action_result) == 0:
         action_result.append(ActionFailure(EmptySelect(element_id=action.element_id)))
@@ -3572,11 +3593,14 @@ async def extract_information_for_navigation_goal(
     )
 
     llm_key_override = task.llm_key
-    if await is_cua_task(task=task):
+    if await service_utils.is_cua_task(task=task):
         # CUA tasks should use the default data extraction llm key
         llm_key_override = None
 
-    llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key_override, default=app.LLM_API_HANDLER)
+    # Use the appropriate LLM handler based on the feature flag
+    llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+    )
     json_response = await llm_api_handler(
         prompt=extract_information_prompt,
         step=step,
@@ -3636,106 +3660,6 @@ async def get_input_value(tag_name: str, locator: Locator) -> str | None:
     return await locator.inner_text()
 
 
-async def poll_verification_code(
-    task_id: str,
-    organization_id: str,
-    workflow_id: str | None = None,
-    workflow_run_id: str | None = None,
-    workflow_permanent_id: str | None = None,
-    totp_verification_url: str | None = None,
-    totp_identifier: str | None = None,
-) -> str | None:
-    timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
-    start_datetime = datetime.utcnow()
-    timeout_datetime = start_datetime + timeout
-    org_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api)
-    if not org_token:
-        LOG.error("Failed to get organization token when trying to get verification code")
-        return None
-    # wait for 40 seconds to let the verification code comes in before polling
-    await asyncio.sleep(settings.VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS)
-    while True:
-        # check timeout
-        if datetime.utcnow() > timeout_datetime:
-            LOG.warning("Polling verification code timed out")
-            raise NoTOTPVerificationCodeFound(
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                workflow_id=workflow_permanent_id,
-                totp_verification_url=totp_verification_url,
-                totp_identifier=totp_identifier,
-            )
-        verification_code = None
-        if totp_verification_url:
-            verification_code = await _get_verification_code_from_url(
-                task_id,
-                totp_verification_url,
-                org_token.token,
-                workflow_run_id=workflow_run_id,
-            )
-        elif totp_identifier:
-            verification_code = await _get_verification_code_from_db(
-                task_id,
-                organization_id,
-                totp_identifier,
-                workflow_id=workflow_permanent_id,
-                workflow_run_id=workflow_run_id,
-            )
-        if verification_code:
-            LOG.info("Got verification code", verification_code=verification_code)
-            return verification_code
-
-        await asyncio.sleep(10)
-
-
-async def _get_verification_code_from_url(
-    task_id: str,
-    url: str,
-    api_key: str,
-    workflow_run_id: str | None = None,
-    workflow_permanent_id: str | None = None,
-) -> str | None:
-    request_data = {"task_id": task_id}
-    if workflow_run_id:
-        request_data["workflow_run_id"] = workflow_run_id
-    if workflow_permanent_id:
-        request_data["workflow_permanent_id"] = workflow_permanent_id
-    payload = json.dumps(request_data)
-    signature = generate_skyvern_signature(
-        payload=payload,
-        api_key=api_key,
-    )
-    timestamp = str(int(datetime.utcnow().timestamp()))
-    headers = {
-        "x-skyvern-timestamp": timestamp,
-        "x-skyvern-signature": signature,
-        "Content-Type": "application/json",
-    }
-    json_resp = await aiohttp_post(url=url, data=request_data, headers=headers, raise_exception=False)
-    return json_resp.get("verification_code", None)
-
-
-async def _get_verification_code_from_db(
-    task_id: str,
-    organization_id: str,
-    totp_identifier: str,
-    workflow_id: str | None = None,
-    workflow_run_id: str | None = None,
-) -> str | None:
-    totp_codes = await app.DATABASE.get_totp_codes(organization_id=organization_id, totp_identifier=totp_identifier)
-    for totp_code in totp_codes:
-        if totp_code.workflow_run_id and workflow_run_id and totp_code.workflow_run_id != workflow_run_id:
-            continue
-        if totp_code.workflow_id and workflow_id and totp_code.workflow_id != workflow_id:
-            continue
-        if totp_code.task_id and totp_code.task_id != task_id:
-            continue
-        if totp_code.expired_at and totp_code.expired_at < datetime.utcnow():
-            continue
-        return totp_code.code
-    return None
-
-
 class AbstractActionForContextParse(BaseModel):
     reasoning: str | None
     element_id: str
@@ -3749,6 +3673,11 @@ async def _get_input_or_select_context(
     step: Step,
     ancestor_depth: int = 5,
 ) -> InputOrSelectContext:
+    # Early return optimization: if action already has input_or_select_context, use it
+    if not isinstance(action, AbstractActionForContextParse) and action.input_or_select_context is not None:
+        return action.input_or_select_context
+
+    # Ancestor depth optimization: use ancestor element for deep DOM structures
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     try:
         depth = await skyvern_frame.get_element_dom_depth(await skyvern_element.get_element_handler())
@@ -3767,7 +3696,7 @@ async def _get_input_or_select_context(
                     starter=element_handle,
                     frame=skyvern_element.get_frame_id(),
                 )
-                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory()
+                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory(step=step)
                 element_tree = await clean_up_func(skyvern_element.get_frame(), "", copy.deepcopy(element_tree))
                 element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
                 element_tree_builder = ScrapedPage(
@@ -3788,7 +3717,8 @@ async def _get_input_or_select_context(
         action_reasoning=action.reasoning,
         element_id=action.element_id,
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(
+    # Use centralized parse-select handler (set at init or via scripts)
+    json_response = await app.PARSE_SELECT_LLM_API_HANDLER(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
     )
     json_response["intention"] = action.intention
@@ -3798,3 +3728,28 @@ async def _get_input_or_select_context(
         context=input_or_select_context,
     )
     return input_or_select_context
+
+
+async def extract_user_defined_errors(
+    task: Task, step: Step, scraped_page: ScrapedPage, reasoning: str | None = None
+) -> list[UserDefinedError]:
+    action_history = await get_action_history(task=task, current_step=step)
+    scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
+    prompt = prompt_engine.load_prompt(
+        "surface-user-defined-errors",
+        navigation_goal=task.navigation_goal,
+        navigation_payload_str=json.dumps(task.navigation_payload),
+        elements=scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML),
+        current_url=scraped_page_refreshed.url,
+        action_history=json.dumps(action_history),
+        error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        reasoning=reasoning,
+    )
+    json_response = await app.EXTRACTION_LLM_API_HANDLER(
+        prompt=prompt,
+        screenshots=scraped_page_refreshed.screenshots,
+        step=step,
+        prompt_name="surface-user-defined-errors",
+    )
+    return [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]

@@ -1,7 +1,8 @@
 import {
-  CheckIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  ClockIcon,
+  CodeIcon,
   CopyIcon,
   PlayIcon,
   ReloadIcon,
@@ -29,28 +30,7 @@ import { useDebugStore } from "@/store/useDebugStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
-import { WorkflowApiResponse } from "../types/workflowTypes";
 import { CacheKeyValuesResponse } from "@/routes/workflows/types/scriptTypes";
-import { OrgWalled } from "@/components/Orgwalled";
-
-function CopyButton({ value }: { value: string }) {
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = () => {
-    if (copied) {
-      return;
-    }
-    window.navigator.clipboard.writeText(value);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
-
-  return (
-    <Button size="icon" variant="ghost" onClick={handleCopy}>
-      {copied ? <CheckIcon /> : <CopyIcon />}
-    </Button>
-  );
-}
 
 interface Dom {
   input: React.MutableRefObject<HTMLInputElement | null>;
@@ -62,15 +42,17 @@ type Props = {
   cacheKeyValuesPanelOpen: boolean;
   parametersPanelOpen: boolean;
   saving: boolean;
-  workflow: WorkflowApiResponse;
+  showAllCode: boolean;
   onCacheKeyValueAccept: (cacheKeyValue: string | null) => void;
   onCacheKeyValuesBlurred: (cacheKeyValue: string | null) => void;
   onCacheKeyValuesFilter: (cacheKeyValue: string) => void;
   onCacheKeyValuesKeydown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
   onParametersClick: () => void;
+  onShowAllCodeClick?: () => void;
   onCacheKeyValuesClick: () => void;
   onSave: () => void;
   onRun?: () => void;
+  onHistory?: () => void;
 };
 
 function WorkflowHeader({
@@ -79,15 +61,17 @@ function WorkflowHeader({
   cacheKeyValuesPanelOpen,
   parametersPanelOpen,
   saving,
-  workflow,
+  showAllCode,
   onCacheKeyValueAccept,
   onCacheKeyValuesBlurred,
   onCacheKeyValuesFilter,
   onCacheKeyValuesKeydown,
   onParametersClick,
+  onShowAllCodeClick,
   onCacheKeyValuesClick,
   onSave,
   onRun,
+  onHistory,
 }: Props) {
   const { title, setTitle } = useWorkflowTitleStore();
   const workflowChangesStore = useWorkflowHasChangesStore();
@@ -106,6 +90,10 @@ function WorkflowHeader({
 
   const dom: Dom = {
     input: useRef<HTMLInputElement>(null),
+  };
+
+  const handleShowAllCode = () => {
+    onShowAllCodeClick?.();
   };
 
   useEffect(() => {
@@ -144,12 +132,22 @@ function WorkflowHeader({
         />
       </div>
       <div className="flex h-full items-center justify-end gap-4">
-        {user && workflow.generate_script && (
-          // (cacheKeyValues?.total_count ?? 0) > 0 && (
-          <OrgWalled className="p-0">
+        {user && (cacheKeyValues?.total_count ?? 0) > 0 && (
+          <>
+            {debugStore.isDebugMode && (
+              <Button
+                className="pl-2 pr-3"
+                size="lg"
+                variant={!showAllCode ? "tertiary" : "default"}
+                onClick={handleShowAllCode}
+              >
+                <CodeIcon className="mr-2 h-6 w-6" />
+                Show Code
+              </Button>
+            )}
             <div
               tabIndex={1}
-              className="flex max-w-[15rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
+              className="flex max-w-[10rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
             >
               <Input
                 ref={dom.input}
@@ -181,7 +179,7 @@ function WorkflowHeader({
                   }
                   onCacheKeyValuesKeydown(e);
                 }}
-                placeholder="Script Key Value"
+                placeholder="Code Key Value"
                 value={chosenCacheKeyValue ?? undefined}
                 onBlur={(e) => {
                   onCacheKeyValuesBlurred(e.target.value);
@@ -202,9 +200,8 @@ function WorkflowHeader({
                   }}
                 />
               )}
-              <CopyButton value={chosenCacheKeyValue ?? ""} />
             </div>
-          </OrgWalled>
+          </>
         )}
         {isGlobalWorkflow ? (
           <Button
@@ -230,38 +227,36 @@ function WorkflowHeader({
           </Button>
         ) : (
           <>
-            {user && (
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      size="icon"
-                      variant={debugStore.isDebugMode ? "default" : "tertiary"}
-                      className="size-10 min-w-[2.5rem]"
-                      disabled={workflowRunIsRunningOrQueued}
-                      onClick={() => {
-                        if (debugStore.isDebugMode) {
-                          navigate(`/workflows/${workflowPermanentId}/edit`);
-                        } else {
-                          navigate(`/workflows/${workflowPermanentId}/debug`);
-                        }
-                      }}
-                    >
-                      {debugStore.isDebugMode ? (
-                        <BrowserIcon className="h-6 w-6" />
-                      ) : (
-                        <BrowserIcon className="h-6 w-6" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    {debugStore.isDebugMode
-                      ? "Turn off Browser"
-                      : "Turn on Browser"}
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            )}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant={debugStore.isDebugMode ? "default" : "tertiary"}
+                    className="size-10 min-w-[2.5rem]"
+                    disabled={workflowRunIsRunningOrQueued}
+                    onClick={() => {
+                      if (debugStore.isDebugMode) {
+                        navigate(`/workflows/${workflowPermanentId}/edit`);
+                      } else {
+                        navigate(`/workflows/${workflowPermanentId}/debug`);
+                      }
+                    }}
+                  >
+                    {debugStore.isDebugMode ? (
+                      <BrowserIcon className="h-6 w-6" />
+                    ) : (
+                      <BrowserIcon className="h-6 w-6" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {debugStore.isDebugMode
+                    ? "Turn off Browser"
+                    : "Turn on Browser"}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -282,6 +277,23 @@ function WorkflowHeader({
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Save</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant="tertiary"
+                    className="size-10 min-w-[2.5rem]"
+                    onClick={() => {
+                      onHistory?.();
+                    }}
+                  >
+                    <ClockIcon className="size-6" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>History</TooltipContent>
               </Tooltip>
             </TooltipProvider>
             <Button variant="tertiary" size="lg" onClick={onParametersClick}>

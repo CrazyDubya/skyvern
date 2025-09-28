@@ -116,11 +116,14 @@ const useWorkflowSave = () => {
         extra_http_headers: extraHttpHeaders,
         generate_script: saveData.settings.useScriptCache,
         cache_key: normalizedKey,
+        ai_fallback: saveData.settings.aiFallback ?? true,
         workflow_definition: {
           parameters: saveData.parameters,
           blocks: saveData.blocks,
         },
         is_saved_task: saveData.workflow.is_saved_task,
+        run_sequentially: saveData.settings.runSequentially,
+        sequential_key: saveData.settings.sequentialKey,
       };
 
       const yaml = convertToYAML(requestBody);

@@ -34,6 +34,7 @@ from skyvern.constants import (
     MAX_UPLOAD_FILE_COUNT,
 )
 from skyvern.exceptions import (
+    AzureConfigurationError,
     ContextParameterValueNotFound,
     MissingBrowserState,
     MissingBrowserStatePage,
@@ -44,7 +45,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.azure import AsyncAzureClient
+from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -581,22 +582,6 @@ class BaseTaskBlock(Block):
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
                     )
-                    # assert that the browser state is not None, otherwise we can't go through typing
-                    assert browser_state is not None
-                    # add screenshot artifact for the first task
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            workflow_run_id,
-                            properties={"organization_id": str(organization_id)},
-                        )
-                    )
-                    if screenshot:
-                        await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
-                            workflow_run_block=workflow_run_block,
-                            artifact_type=ArtifactType.SCREENSHOT_LLM,
-                            data=screenshot,
-                        )
                 except Exception as e:
                     LOG.exception(
                         "Failed to get browser state for first task",
@@ -611,6 +596,28 @@ class BaseTaskBlock(Block):
                         failure_reason=str(e),
                     )
                     raise e
+                try:
+                    # add screenshot artifact for the first task
+                    screenshot = await browser_state.take_fullpage_screenshot(
+                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                            "ENABLE_PLAYWRIGHT_FULLPAGE",
+                            workflow_run_id,
+                            properties={"organization_id": str(organization_id)},
+                        )
+                    )
+                    if screenshot:
+                        await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                            workflow_run_block=workflow_run_block,
+                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            data=screenshot,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to take screenshot for first task",
+                        task_id=task.task_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
             else:
                 # if not the first task block, need to navigate manually
                 browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
@@ -911,14 +918,14 @@ class ForLoopBlock(Block):
 
         return context_parameters
 
-    async def get_loop_over_parameter_values(
+    async def get_values_from_loop_variable_reference(
         self,
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None = None,
     ) -> list[Any]:
-        # parse the value from self.loop_variable_reference and then from self.loop_over
+        parameter_value = None
         if self.loop_variable_reference:
             LOG.debug("Processing loop variable reference", loop_variable_reference=self.loop_variable_reference)
 
@@ -1022,6 +1029,26 @@ class ForLoopBlock(Block):
                     raise FailedToFormatJinjaStyleParameter(value_template, str(e))
                 parameter_value = json.loads(value_json)
 
+        if isinstance(parameter_value, list):
+            return parameter_value
+        else:
+            return [parameter_value]
+
+    async def get_loop_over_parameter_values(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+    ) -> list[Any]:
+        # parse the value from self.loop_variable_reference and then from self.loop_over
+        if self.loop_variable_reference:
+            return await self.get_values_from_loop_variable_reference(
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
         elif self.loop_over is not None:
             if isinstance(self.loop_over, WorkflowParameter):
                 parameter_value = workflow_run_context.get_value(self.loop_over.key)
@@ -1158,6 +1185,7 @@ class ForLoopBlock(Block):
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value)
+            # context parameter has been deprecated. However, it's still used by task v2 - we should migrate away from it.
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
             for context_parameter in context_parameters_with_value:
                 workflow_run_context.set_value(context_parameter.key, context_parameter.value)
@@ -1408,6 +1436,7 @@ class CodeBlock(Block):
             "bool": bool,
             "asyncio": asyncio,
             "re": re,
+            "Exception": Exception,
         }
 
     def generate_async_user_function(
@@ -1454,7 +1483,7 @@ async def wrapper():
                 "Getting browser state for workflow run from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
             if browser_state:
                 LOG.info("Was occupying session here, but no longer.", browser_session_id=browser_session_id)
         else:
@@ -2054,9 +2083,12 @@ class FileUploadBlock(Block):
                     workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_key)
                     or self.azure_storage_account_key
                 )
-                azure_client = AsyncAzureClient(
-                    account_name=actual_azure_storage_account_name or "",
-                    account_key=actual_azure_storage_account_key or "",
+                if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
+                    raise AzureConfigurationError("Azure Storage is not configured")
+
+                azure_client = AsyncAzureStorageClient(
+                    storage_account_name=actual_azure_storage_account_name,
+                    storage_account_key=actual_azure_storage_account_key,
                 )
                 for file_path in files_to_upload:
                     blob_name = Path(file_path).name
@@ -3053,6 +3085,9 @@ class TaskV2Block(Block):
         finally:
             context: skyvern_context.SkyvernContext | None = skyvern_context.current()
             current_run_id = context.run_id if context and context.run_id else workflow_run_id
+            root_workflow_run_id = (
+                context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
+            )
             skyvern_context.set(
                 skyvern_context.SkyvernContext(
                     organization_id=organization_id,
@@ -3060,6 +3095,7 @@ class TaskV2Block(Block):
                     workflow_id=workflow_run.workflow_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
+                    root_workflow_run_id=root_workflow_run_id,
                     run_id=current_run_id,
                     browser_session_id=browser_session_id,
                     max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,

@@ -121,7 +121,10 @@ class Settings(BaseSettings):
     SINGLE_CLICK_AGENT_LLM_KEY: str | None = None
     SINGLE_INPUT_AGENT_LLM_KEY: str | None = None
     PROMPT_BLOCK_LLM_KEY: str | None = None
+    PARSE_SELECT_LLM_KEY: str | None = None
     EXTRACTION_LLM_KEY: str | None = None
+    CHECK_USER_GOAL_LLM_KEY: str | None = None
+    AUTO_COMPLETION_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -304,7 +307,7 @@ class Settings(BaseSettings):
     SVG_MAX_LENGTH: int = 100000
 
     ENABLE_LOG_ARTIFACTS: bool = False
-    ENABLE_CODE_BLOCK: bool = False
+    ENABLE_CODE_BLOCK: bool = True
 
     TASK_BLOCKED_SITE_FALLBACK_URL: str = "https://www.google.com"
 
@@ -365,6 +368,10 @@ class Settings(BaseSettings):
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
+                "gemini-2.5-flash-lite": {
+                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
+                    "label": "Gemini 2.5 Flash Lite",
+                },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
@@ -392,6 +399,10 @@ class Settings(BaseSettings):
                 "gemini-2.5-flash-preview-05-20": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
+                },
+                "gemini-2.5-flash-lite": {
+                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
+                    "label": "Gemini 2.5 Flash Lite",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},

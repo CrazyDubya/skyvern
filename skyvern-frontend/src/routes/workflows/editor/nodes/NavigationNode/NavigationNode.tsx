@@ -117,6 +117,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
               "bg-slate-950 outline outline-2 outline-slate-300":
                 thisBlockIsTargetted,
             },
+            data.comparisonColor,
           )}
         >
           <NodeHeader
@@ -307,7 +308,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                           onChange={(value) => {
                             handleChange("errorCodeMapping", value);
                           }}
-                          className="nowheel nopan"
+                          className="nopan"
                           fontSize={8}
                         />
                       </div>

@@ -164,7 +164,11 @@ async def initialize_task_v2(
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
+    generate_script: bool = False,
 ) -> TaskV2:
+    if generate_script:
+        publish_workflow = True
+
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
         organization_id=organization.organization_id,
@@ -178,6 +182,7 @@ async def initialize_task_v2(
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
         browser_address=browser_address,
+        generate_script=generate_script,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -224,6 +229,7 @@ async def initialize_task_v2(
             status=workflow_status,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            generate_script=generate_script,
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -460,16 +466,25 @@ async def run_task_v2_helper(
 
     context: skyvern_context.SkyvernContext | None = skyvern_context.current()
     current_run_id = context.run_id if context and context.run_id else task_v2_id
+    # task v2 can be nested inside a workflow run, so we need to use the root workflow run id
+    root_workflow_run_id = context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
+    enable_parse_select_in_extract = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+        "ENABLE_PARSE_SELECT_IN_EXTRACT",
+        current_run_id,
+        properties={"organization_id": organization_id, "task_url": task_v2.url},
+    )
     skyvern_context.set(
         SkyvernContext(
             organization_id=organization_id,
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
+            root_workflow_run_id=root_workflow_run_id,
             request_id=request_id,
             task_v2_id=task_v2_id,
             run_id=current_run_id,
             browser_session_id=browser_session_id,
             max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
+            enable_parse_select_in_extract=bool(enable_parse_select_in_extract),
         )
     )
 
@@ -886,6 +901,11 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=completion_screenshots,
                 )
+                if task_v2.generate_script:
+                    await app.WORKFLOW_SERVICE.generate_script_if_needed(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                    )
                 break
 
         # total step number validation
@@ -1267,6 +1287,7 @@ async def _generate_extraction_task(
         generate_extraction_task_prompt,
         task_v2=task_v2,
         prompt_name="task_v2_generate_extraction_task",
+        organization_id=task_v2.organization_id,
     )
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
 
@@ -1391,13 +1412,41 @@ async def get_task_v2(task_v2_id: str, organization_id: str | None = None) -> Ta
     return await app.DATABASE.get_task_v2(task_v2_id, organization_id=organization_id)
 
 
+async def _update_task_v2_status(
+    task_v2_id: str,
+    status: TaskV2Status,
+    organization_id: str | None = None,
+    summary: str | None = None,
+    output: dict[str, Any] | None = None,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id, organization_id=organization_id, status=status, summary=summary, output=output
+    )
+    if status in [TaskV2Status.completed, TaskV2Status.failed, TaskV2Status.terminated]:
+        start_time = (
+            task_v2.started_at.replace(tzinfo=UTC) if task_v2.started_at else task_v2.created_at.replace(tzinfo=UTC)
+        )
+        queued_seconds = (start_time - task_v2.created_at.replace(tzinfo=UTC)).total_seconds()
+        duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
+        LOG.info(
+            "Task v2 duration metrics",
+            task_v2_id=task_v2_id,
+            workflow_run_id=task_v2.workflow_run_id,
+            duration_seconds=duration_seconds,
+            queued_seconds=queued_seconds,
+            task_v2_status=task_v2.status,
+            organization_id=organization_id,
+        )
+    return task_v2
+
+
 async def mark_task_v2_as_failed(
     task_v2_id: str,
     workflow_run_id: str | None = None,
     failure_reason: str | None = None,
     organization_id: str | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.failed,
@@ -1417,7 +1466,7 @@ async def mark_task_v2_as_completed(
     summary: str | None = None,
     output: dict[str, Any] | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.completed,
@@ -1426,17 +1475,6 @@ async def mark_task_v2_as_completed(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
-
-    # Track task v2 duration when completed
-    duration_seconds = (datetime.now(UTC) - task_v2.created_at.replace(tzinfo=UTC)).total_seconds()
-    LOG.info(
-        "Task v2 duration metrics",
-        task_v2_id=task_v2_id,
-        workflow_run_id=workflow_run_id,
-        duration_seconds=duration_seconds,
-        task_v2_status=TaskV2Status.completed,
-        organization_id=organization_id,
-    )
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1447,7 +1485,7 @@ async def mark_task_v2_as_canceled(
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.canceled,
@@ -1464,7 +1502,7 @@ async def mark_task_v2_as_terminated(
     organization_id: str | None = None,
     failure_reason: str | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.terminated,
@@ -1481,7 +1519,7 @@ async def mark_task_v2_as_timed_out(
     organization_id: str | None = None,
     failure_reason: str | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.timed_out,
@@ -1497,7 +1535,7 @@ async def update_task_v2_status_to_workflow_run_status(
     workflow_run_status: WorkflowRunStatus,
     organization_id: str,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status(workflow_run_status),
@@ -1673,6 +1711,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             data_extraction_schema=task_v2.extracted_information_schema,
             error_code_mapping=task_v2.error_code_mapping,
         ),
+        errors=workflow_run_resp.errors if workflow_run_resp else None,
     )
 
 
@@ -1684,7 +1723,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         return
     api_key = await app.DATABASE.get_valid_org_auth_token(
         organization_id,
-        OrganizationAuthTokenType.api,
+        OrganizationAuthTokenType.api.value,
     )
     if not api_key:
         LOG.warning(

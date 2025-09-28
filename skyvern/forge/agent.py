@@ -26,11 +26,20 @@ from skyvern.constants import (
     SPECIAL_FIELD_VERIFICATION_CODE,
     ScrapeType,
 )
+from skyvern.core.totp import poll_verification_code
+from skyvern.errors.errors import (
+    GetTOTPVerificationCodeError,
+    ReachMaxRetriesError,
+    ReachMaxStepsError,
+    TimeoutGetTOTPVerificationCodeError,
+    UserDefinedError,
+)
 from skyvern.exceptions import (
     BrowserSessionNotFound,
     BrowserStateMissingPage,
     DownloadFileMaxWaitingTime,
     EmptyScrapePage,
+    FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
     FailedToSendWebhook,
@@ -53,6 +62,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
@@ -77,10 +87,10 @@ from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, 
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services import run_service
-from skyvern.services.task_v1_service import is_cua_task
+from skyvern.services import run_service, service_utils
+from skyvern.services.action_service import get_action_history
 from skyvern.utils.image_resizer import Resolution
-from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -91,11 +101,10 @@ from skyvern.webeye.actions.actions import (
     ExtractAction,
     ReloadPageAction,
     TerminateAction,
-    UserDefinedError,
     WebAction,
 )
 from skyvern.webeye.actions.caching import retrieve_action_plan
-from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
+from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
     parse_actions,
@@ -189,6 +198,7 @@ class ForgeAgent:
             max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             extra_http_headers=workflow_run.extra_http_headers,
             browser_address=workflow_run.browser_address,
+            browser_session_id=workflow_run.browser_session_id,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -387,6 +397,12 @@ class ForgeAgent:
                         context.run_id if context and context.run_id else task.workflow_run_id
                     )
                 )
+            if task.browser_session_id:
+                browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=organization.organization_id,
+                    browser_session_id=task.browser_session_id,
+                )
+                list_files_before = list_files_before + browser_session_downloaded_files
             # Check some conditions before executing the step, throw an exception if the step can't be executed
             await app.AGENT_FUNCTION.validate_step_execution(task, step)
 
@@ -470,7 +486,13 @@ class ForgeAgent:
                     context.run_id if context and context.run_id else task.workflow_run_id
                 )
 
-                downloading_files: list[Path] = list_downloading_files_in_directory(workflow_download_directory)
+                downloading_files = list_downloading_files_in_directory(workflow_download_directory)
+                if task.browser_session_id:
+                    browser_session_downloading_files = await app.STORAGE.list_downloading_files_in_browser_session(
+                        organization_id=organization.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                    downloading_files = downloading_files + browser_session_downloading_files
                 if len(downloading_files) > 0:
                     LOG.info(
                         "Detecting files are still downloading, waiting for files to be completely downloaded.",
@@ -489,9 +511,23 @@ class ForgeAgent:
                         )
 
                 list_files_after = list_files_in_directory(workflow_download_directory)
+                if task.browser_session_id:
+                    browser_session_downloaded_files_after = await app.STORAGE.list_downloaded_files_in_browser_session(
+                        organization_id=organization.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                    list_files_after = list_files_after + browser_session_downloaded_files_after
                 if len(list_files_after) > len(list_files_before):
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
+                        if file.startswith("s3://"):
+                            file_data = await aws_client.download_file(file, log_exception=False)
+                            if not file_data:
+                                continue
+                            file = file.split("/")[-1]  # Extract filename from the end of S3 URI
+                            with open(os.path.join(workflow_download_directory, file), "wb") as f:
+                                f.write(file_data)
+
                         file_extension = Path(file).suffix
                         if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                             LOG.warning(
@@ -893,6 +929,7 @@ class ForgeAgent:
             (
                 scraped_page,
                 extract_action_prompt,
+                use_caching,
             ) = await self.build_and_record_step_prompt(
                 task,
                 step,
@@ -954,6 +991,12 @@ class ForgeAgent:
                     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                         llm_key_override, default=app.LLM_API_HANDLER
                     )
+                    # Add caching flag to context for monitoring
+                    if use_caching:
+                        context = skyvern_context.current()
+                        if context:
+                            context.use_prompt_caching = True
+
                     json_response = await llm_api_handler(
                         prompt=extract_action_prompt,
                         prompt_name="extract-actions",
@@ -970,6 +1013,8 @@ class ForgeAgent:
                         )
                         detailed_agent_step_output.llm_response = json_response
                         actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
+                        if context:
+                            context.pop_totp_code(task.task_id)
                     except NoTOTPVerificationCodeFound:
                         actions = [
                             TerminateAction(
@@ -981,6 +1026,21 @@ class ForgeAgent:
                                 action_order=0,
                                 reasoning="No TOTP verification code found. Going to terminate.",
                                 intention="No TOTP verification code found. Going to terminate.",
+                                errors=[TimeoutGetTOTPVerificationCodeError().to_user_defined_error()],
+                            )
+                        ]
+                    except FailedToGetTOTPVerificationCode as e:
+                        actions = [
+                            TerminateAction(
+                                reasoning=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                                intention=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                                organization_id=task.organization_id,
+                                workflow_run_id=task.workflow_run_id,
+                                task_id=task.task_id,
+                                step_id=step.step_id,
+                                step_order=step.order,
+                                action_order=0,
+                                errors=[GetTOTPVerificationCodeError(reason=e.reason).to_user_defined_error()],
                             )
                         ]
 
@@ -1123,6 +1183,7 @@ class ForgeAgent:
                     # set verified to True will skip the completion verification
                     action.verified = True
                 results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
+                await app.AGENT_FUNCTION.post_action_execution()
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
                     results,
@@ -1265,6 +1326,7 @@ class ForgeAgent:
                         complete_results = await ActionHandler.handle_action(
                             scraped_page, task, step, working_page, complete_action
                         )
+                        await app.AGENT_FUNCTION.post_action_execution()
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state, engine)
 
@@ -1284,6 +1346,7 @@ class ForgeAgent:
                 extract_results = await ActionHandler.handle_action(
                     scraped_page, task, step, working_page, extract_action
                 )
+                await app.AGENT_FUNCTION.post_action_execution()
                 detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
 
             # If no action errors return the agent state and output
@@ -1637,7 +1700,7 @@ class ForgeAgent:
         )
         scroll = True
         llm_key_override = task.llm_key
-        if await is_cua_task(task=task):
+        if await service_utils.is_cua_task(task=task):
             scroll = False
             llm_key_override = None
 
@@ -1870,7 +1933,7 @@ class ForgeAgent:
         step: Step,
         browser_state: BrowserState,
         engine: RunEngine,
-    ) -> tuple[ScrapedPage, str]:
+    ) -> tuple[ScrapedPage, str, bool]:
         # start the async tasks while running scrape_website
         if engine not in CUA_ENGINES:
             self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
@@ -1881,6 +1944,8 @@ class ForgeAgent:
         # second time: try again the normal scrape, (stopping window loading before scraping barely helps, but causing problem)
         # third time: reload the page before scraping
         scraped_page: ScrapedPage | None = None
+        extract_action_prompt = ""
+        use_caching = False
         for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
             try:
                 scraped_page = await self._scrape_with_type(
@@ -1924,7 +1989,7 @@ class ForgeAgent:
         element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
         extract_action_prompt = ""
         if engine not in CUA_ENGINES:
-            extract_action_prompt = await self._build_extract_action_prompt(
+            extract_action_prompt, use_caching = await self._build_extract_action_prompt(
                 task,
                 step,
                 browser_state,
@@ -1959,7 +2024,7 @@ class ForgeAgent:
             data=element_tree_in_prompt.encode(),
         )
 
-        return scraped_page, extract_action_prompt
+        return scraped_page, extract_action_prompt, use_caching
 
     async def _build_extract_action_prompt(
         self,
@@ -1969,7 +2034,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         verification_code_check: bool = False,
         expire_verification_code: bool = False,
-    ) -> str:
+    ) -> tuple[str, bool]:
         actions_and_results_str = await self._get_action_results(task)
 
         # Generate the extract action prompt
@@ -2024,7 +2089,45 @@ class ForgeAgent:
             raise UnsupportedTaskType(task_type=task_type)
 
         context = skyvern_context.ensure_context()
-        return load_prompt_with_elements(
+
+        # Check if prompt caching is enabled for extract-action
+        use_caching = False
+        if (
+            template == "extract-action"
+            and LLMAPIHandlerFactory._prompt_caching_settings
+            and LLMAPIHandlerFactory._prompt_caching_settings.get("extract-action", False)
+        ):
+            try:
+                # Try to load split templates for caching
+                static_prompt = prompt_engine.load_prompt(f"{template}-static")
+                dynamic_prompt = prompt_engine.load_prompt(
+                    f"{template}-dynamic",
+                    navigation_goal=navigation_goal,
+                    navigation_payload_str=json.dumps(final_navigation_payload),
+                    starting_url=starting_url,
+                    current_url=current_url,
+                    data_extraction_goal=task.data_extraction_goal,
+                    action_history=actions_and_results_str,
+                    error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+                    local_datetime=datetime.now(context.tz_info).isoformat(),
+                    verification_code_check=verification_code_check,
+                    complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                    terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+                    parse_select_feature_enabled=context.enable_parse_select_in_extract,
+                )
+
+                # Store static prompt for caching and return dynamic prompt
+                context.cached_static_prompt = static_prompt
+                use_caching = True
+                LOG.info("Using cached prompt for extract-action", task_id=task.task_id)
+                return dynamic_prompt, use_caching
+
+            except Exception as e:
+                LOG.warning("Failed to load cached prompt templates, falling back to original", error=str(e))
+                # Fall through to original behavior
+
+        # Original behavior - load full prompt
+        full_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page,
             prompt_engine=prompt_engine,
             template_name=template,
@@ -2039,7 +2142,10 @@ class ForgeAgent:
             verification_code_check=verification_code_check,
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+            parse_select_feature_enabled=context.enable_parse_select_in_extract,
         )
+
+        return full_prompt, use_caching
 
     def _build_navigation_payload(
         self,
@@ -2067,47 +2173,7 @@ class ForgeAgent:
         return final_navigation_payload
 
     async def _get_action_results(self, task: Task, current_step: Step | None = None) -> str:
-        """
-        Get the action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps.
-        If current_step is provided, the current executing step will be included in the action history.
-        Default is excluding the current executing step from the action history.
-        """
-
-        # Get action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps
-        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
-        # the last step is always the newly created one and it should be excluded from the history window
-        window_steps = steps[-1 - settings.PROMPT_ACTION_HISTORY_WINDOW : -1]
-        if current_step:
-            window_steps.append(current_step)
-
-        actions_and_results: list[tuple[Action, list[ActionResult]]] = []
-        for window_step in window_steps:
-            if window_step.output and window_step.output.actions_and_results:
-                actions_and_results.extend(window_step.output.actions_and_results)
-
-        # exclude successful action from history
-        action_history = [
-            {
-                "action": action.model_dump(
-                    exclude_none=True,
-                    include={"action_type", "element_id", "status", "reasoning", "option", "download"},
-                ),
-                "results": [
-                    result.model_dump(
-                        exclude_none=True,
-                        include={
-                            "success",
-                            "exception_type",
-                            "exception_message",
-                        },
-                    )
-                    for result in results
-                ],
-            }
-            for action, results in actions_and_results
-            if len(results) > 0
-        ]
-        return json.dumps(action_history)
+        return json.dumps(await get_action_history(task=task, current_step=current_step))
 
     async def get_extracted_information_for_task(self, task: Task) -> dict[str, Any] | list | str | None:
         """
@@ -2574,6 +2640,7 @@ class ForgeAgent:
         extracted_information: dict[str, Any] | list | str | None = None,
         failure_reason: str | None = None,
         webhook_failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
     ) -> Task:
         # refresh task from db to get the latest status
         task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
@@ -2588,6 +2655,8 @@ class ForgeAgent:
             updates["extracted_information"] = extracted_information
         if failure_reason is not None:
             updates["failure_reason"] = failure_reason
+        if errors is not None:
+            updates["errors"] = errors
         update_comparison = {
             key: {"old": getattr(task, key), "new": value}
             for key, value in updates.items()
@@ -2596,12 +2665,15 @@ class ForgeAgent:
 
         # Track task duration when task is completed, failed, or terminated
         if status in [TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated]:
-            duration_seconds = (datetime.now(UTC) - task.created_at.replace(tzinfo=UTC)).total_seconds()
+            start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
+            queued_seconds = (start_time - task.created_at.replace(tzinfo=UTC)).total_seconds()
+            duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
                 duration_seconds=duration_seconds,
+                queued_seconds=queued_seconds,
                 task_status=status,
                 organization_id=task.organization_id,
             )
@@ -2649,6 +2721,7 @@ class ForgeAgent:
                 failure_reason=(
                     f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_reason}"
                 ),
+                errors=[ReachMaxRetriesError().model_dump()],
             )
             return None
         else:
@@ -2673,7 +2746,7 @@ class ForgeAgent:
         task: Task,
         step: Step,
         page: Page | None,
-    ) -> str:
+    ) -> MaxStepsReasonResponse:
         steps_results = []
         try:
             steps = await app.DATABASE.get_task_steps(
@@ -2684,7 +2757,12 @@ class ForgeAgent:
                     continue
 
                 if len(step.output.errors) > 0:
-                    return ";".join([repr(err) for err in step.output.errors])
+                    failure_reason = ";".join([repr(err) for err in step.output.errors])
+                    return MaxStepsReasonResponse(
+                        page_info="",
+                        reasoning=failure_reason,
+                        errors=step.output.errors,
+                    )
 
                 if step.output.actions_and_results is None:
                     continue
@@ -2703,7 +2781,7 @@ class ForgeAgent:
                 steps_results.append(step_result)
 
             scroll = True
-            if await is_cua_task(task=task):
+            if await service_utils.is_cua_task(task=task):
                 scroll = False
 
             screenshots: list[bytes] = []
@@ -2716,18 +2794,27 @@ class ForgeAgent:
                 navigation_goal=task.navigation_goal,
                 navigation_payload=task.navigation_payload,
                 steps=steps_results,
+                error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await app.LLM_API_HANDLER(
                 prompt=prompt, screenshots=screenshots, step=step, prompt_name="summarize-max-steps-reason"
             )
-            return json_response.get("reasoning", "")
+            return MaxStepsReasonResponse.model_validate(json_response)
         except Exception:
             LOG.warning("Failed to summary the failure reason", task_id=task.task_id, step_id=step.step_id)
             if steps_results:
                 last_step_result = steps_results[-1]
-                return f"Step {last_step_result['order']}: {last_step_result['actions_result']}"
-            return ""
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=f"Step {last_step_result['order']}: {last_step_result['actions_result']}",
+                    errors=[],
+                )
+            return MaxStepsReasonResponse(
+                page_info="",
+                reasoning="",
+                errors=[],
+            )
 
     async def summary_failure_reason_for_max_retries(
         self,
@@ -2777,7 +2864,7 @@ class ForgeAgent:
                 max_retries=max_retries,
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
-            json_response = await app.LLM_API_HANDLER(
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
                 prompt=prompt,
                 screenshots=screenshots,
                 step=step,
@@ -2871,20 +2958,22 @@ class ForgeAgent:
             )
             last_step = await self.update_step(step, is_last=True)
 
-            failure_reason = await self.summary_failure_reason_for_max_steps(
+            generated_failure_reason = await self.summary_failure_reason_for_max_steps(
                 organization=organization,
                 task=task,
                 step=step,
                 page=page,
             )
-            failure_reason = (
-                f"Reached the maximum steps ({max_steps_per_run}). Possible failure reasons: {failure_reason}"
-            )
+            failure_reason = f"Reached the maximum steps ({max_steps_per_run}). Possible failure reasons: {generated_failure_reason.reasoning}"
+            errors = [ReachMaxStepsError().model_dump()] + [
+                error.model_dump() for error in generated_failure_reason.errors
+            ]
 
             await self.update_task(
                 task,
                 status=TaskStatus.failed,
                 failure_reason=failure_reason,
+                errors=errors,
             )
             return False, last_step, None
         else:
@@ -2935,8 +3024,8 @@ class ForgeAgent:
                     workflow_id = workflow_run.workflow_id
                     workflow_permanent_id = workflow_run.workflow_permanent_id
             verification_code = await poll_verification_code(
-                task.task_id,
-                task.organization_id,
+                organization_id=task.organization_id,
+                task_id=task.task_id,
                 workflow_id=workflow_id,
                 workflow_run_id=task.workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -2946,20 +3035,25 @@ class ForgeAgent:
             current_context = skyvern_context.ensure_context()
             current_context.totp_codes[task.task_id] = verification_code
 
-            extract_action_prompt = await self._build_extract_action_prompt(
+            extract_action_prompt, use_caching = await self._build_extract_action_prompt(
                 task,
                 step,
                 browser_state,
                 scraped_page,
                 verification_code_check=False,
-                expire_verification_code=True,
             )
             llm_key_override = task.llm_key
-            if await is_cua_task(task=task):
+            if await service_utils.is_cua_task(task=task):
                 llm_key_override = None
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 llm_key_override, default=app.LLM_API_HANDLER
             )
+            # Add caching flag to context for monitoring
+            if use_caching:
+                context = skyvern_context.current()
+                if context:
+                    context.use_prompt_caching = True
+
             return await llm_api_handler(
                 prompt=extract_action_prompt,
                 step=step,
@@ -3004,12 +3098,13 @@ class ForgeAgent:
             local_datetime=datetime.now(context.tz_info).isoformat(),
         )
 
-        data_extraction_summary_resp = await app.SECONDARY_LLM_API_HANDLER(
+        data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
             prompt=prompt, step=step, prompt_name="data-extraction-summary"
         )
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
             data_extraction_goal=task.data_extraction_goal,
+            data_extraction_schema=task.extracted_information_schema,
             organization_id=task.organization_id,
             task_id=task.task_id,
             workflow_run_id=task.workflow_run_id,
