@@ -9,7 +9,7 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.11,<3.14"
 skyvern = ">=0.2.0"
-llama-index = "^0.12.19"
+llama-index = ">=0.12.19,<0.14.0"
 
 
 [tool.poetry.group.dev.dependencies]
